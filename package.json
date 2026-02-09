@@ -1,0 +1,9 @@
+{
+  "name": "threema-decrypt",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1"
+  }
+}
