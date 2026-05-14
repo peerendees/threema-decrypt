@@ -54,12 +54,25 @@ async function handleSend(req, res) {
   }
 
   try {
-    // Nachricht verschlüsseln
-    const nonce = nacl.randomBytes(24);
-    const messageBytes = new TextEncoder().encode('\x01' + text);
+    // Typ-Byte + Text (Threema-Format: erstes Byte = Message-Type, 0x01 = Text)
+    const textBytes = new TextEncoder().encode(text);
+    const messageData = new Uint8Array(1 + textBytes.length);
+    messageData[0] = 0x01;
+    messageData.set(textBytes, 1);
 
+    // PKCS#7-Padding (Threema-Pflicht: padded_data >= 32 Bytes, 1-255 Padding-Bytes)
+    let padLength = Math.floor(Math.random() * 255) + 1;
+    if (messageData.length + padLength < 32) {
+      padLength = 32 - messageData.length;
+    }
+    const paddedData = new Uint8Array(messageData.length + padLength);
+    paddedData.set(messageData);
+    paddedData.fill(padLength, messageData.length);
+
+    // NaCl box verschlüsseln
+    const nonce = nacl.randomBytes(24);
     const encrypted = nacl.box(
-      messageBytes,
+      paddedData,
       nonce,
       hexToBytes(recipientPublicKey),
       hexToBytes(gatewayPrivateKey)
