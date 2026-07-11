@@ -232,6 +232,20 @@ async function mistralOcrFromImageBytes(
   });
 }
 
+/** BER-95: Magic-Byte-Check — nur nachweislich intakte JPEG/PNG gelten als verarbeitbar. */
+function detectImageMime(bytes: Uint8Array): string | null {
+  if (bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    bytes.length > 7 && bytes[0] === 0x89 && bytes[1] === 0x50 &&
+    bytes[2] === 0x4e && bytes[3] === 0x47
+  ) {
+    return "image/png";
+  }
+  return null;
+}
+
 async function handleDecryptBlob(body: Record<string, string>) {
   const { blobBase64, blobKey } = body;
   if (!blobBase64 || !blobKey) {
@@ -248,10 +262,19 @@ async function handleDecryptBlob(body: Record<string, string>) {
     return jsonResponse({ error: "Blob decryption failed" }, 400);
   }
 
+  const detectedMime = detectImageMime(decrypted);
+  if (!detectedMime) {
+    return jsonResponse(
+      { error: "Foto ist kein gültiges JPEG/PNG (beschädigt oder nicht unterstütztes Format)" },
+      422,
+    );
+  }
+
   const imageBase64 = bytesToBase64(decrypted);
   return jsonResponse({
     success: true,
     imageBase64,
+    detectedMime,
     size: decrypted.length,
   });
 }
