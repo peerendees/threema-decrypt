@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Umgebungsvariablen mit Credentials
+.env
+.env.local
+.env*.local
+
+# Vercel
+.vercel
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

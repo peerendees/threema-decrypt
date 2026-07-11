@@ -1,0 +1,2 @@
+[functions.threema-decrypt]
+verify_jwt = false

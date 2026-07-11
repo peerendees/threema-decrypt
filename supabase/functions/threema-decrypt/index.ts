@@ -1,0 +1,481 @@
+import nacl from "npm:tweetnacl@1.0.3";
+
+const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "";
+const API_TOKEN = Deno.env.get("DECRYPT_API_TOKEN") || "";
+const MISTRAL_API_KEY = Deno.env.get("MISTRAL_API_KEY") || "";
+const MISTRAL_VISION_MODEL =
+  Deno.env.get("MISTRAL_VISION_MODEL") || "pixtral-12b-2409";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
+const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+const BELEGE_BUCKET = "belege-archiv";
+
+function corsHeaders(): HeadersInit {
+  if (!ALLOWED_ORIGIN) return {};
+  return {
+    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+    Vary: "Origin",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  };
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders(),
+    },
+  });
+}
+
+function isAuthorized(req: Request): boolean {
+  if (!API_TOKEN) return false;
+  const header = req.headers.get("authorization") || "";
+  const prefix = "Bearer ";
+  if (!header.startsWith(prefix)) return false;
+  const provided = new TextEncoder().encode(header.slice(prefix.length));
+  const expected = new TextEncoder().encode(API_TOKEN);
+  if (provided.length !== expected.length) return false;
+  let ok = 0;
+  for (let i = 0; i < provided.length; i++) {
+    ok |= provided[i] ^ expected[i];
+  }
+  return ok === 0;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/** Threema E2E: PKCS#7-Padding (mind. 32 Bytes), sonst wird das letzte Textbyte als Pad-Länge gelesen. */
+function padThreemaInnerMessage(payload: Uint8Array): Uint8Array {
+  let padLen = 1 + (nacl.randomBytes(1)[0] % 255);
+  while (payload.length + padLen < 32) {
+    padLen++;
+  }
+  const padded = new Uint8Array(payload.length + padLen);
+  padded.set(payload);
+  padded.fill(padLen, payload.length);
+  return padded;
+}
+
+async function handleDecrypt(body: Record<string, string>) {
+  const { box, nonce, from, gatewayPrivateKey, senderPublicKey } = body;
+  if (!box || !nonce || !gatewayPrivateKey || !senderPublicKey) {
+    return jsonResponse({ error: "Missing parameters" }, 400);
+  }
+
+  const decrypted = nacl.box.open(
+    hexToBytes(box),
+    hexToBytes(nonce),
+    hexToBytes(senderPublicKey),
+    hexToBytes(gatewayPrivateKey),
+  );
+
+  if (!decrypted) {
+    return jsonResponse({ error: "Decryption failed" }, 400);
+  }
+
+  const text = new TextDecoder("latin1").decode(decrypted);
+  return jsonResponse({ text, from, success: true });
+}
+
+async function handleSend(body: Record<string, string>) {
+  const { to, text, gatewayId, gatewaySecret, gatewayPrivateKey, recipientPublicKey } =
+    body;
+
+  if (!to || !text || !gatewayId || !gatewaySecret || !gatewayPrivateKey ||
+    !recipientPublicKey) {
+    return jsonResponse({ error: "Missing parameters" }, 400);
+  }
+
+  const nonce = nacl.randomBytes(24);
+  const inner = padThreemaInnerMessage(new TextEncoder().encode("\x01" + text));
+  const encrypted = nacl.box(
+    inner,
+    nonce,
+    hexToBytes(recipientPublicKey),
+    hexToBytes(gatewayPrivateKey),
+  );
+
+  const params = new URLSearchParams({
+    from: gatewayId,
+    to,
+    secret: gatewaySecret,
+    nonce: bytesToHex(nonce),
+    box: bytesToHex(encrypted),
+  });
+
+  const response = await fetch("https://msgapi.threema.ch/send_e2e", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    return jsonResponse({
+      error: "Threema API error",
+      status: response.status,
+      response: responseText,
+    }, response.status);
+  }
+
+  return jsonResponse({ success: true, messageId: responseText.trim() });
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function mistralOcrFromImageBytes(
+  imageBytes: Uint8Array,
+  fileName = "beleg.jpg",
+) {
+  if (!MISTRAL_API_KEY) {
+    return jsonResponse({ error: "MISTRAL_API_KEY not configured" }, 500);
+  }
+
+  const form = new FormData();
+  form.append("purpose", "ocr");
+  form.append("file", new Blob([imageBytes], { type: "image/jpeg" }), fileName);
+
+  const uploadRes = await fetch("https://api.mistral.ai/v1/files", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
+    body: form,
+  });
+  const uploadText = await uploadRes.text();
+  if (!uploadRes.ok) {
+    return jsonResponse({
+      error: "Mistral file upload failed",
+      status: uploadRes.status,
+      response: uploadText.slice(0, 1000),
+    }, uploadRes.status);
+  }
+
+  const uploaded = JSON.parse(uploadText);
+  const fileId = uploaded.id as string;
+
+  const urlRes = await fetch(`https://api.mistral.ai/v1/files/${fileId}/url`, {
+    headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
+  });
+  const urlText = await urlRes.text();
+  if (!urlRes.ok) {
+    return jsonResponse({
+      error: "Mistral signed URL failed",
+      status: urlRes.status,
+      response: urlText.slice(0, 1000),
+    }, urlRes.status);
+  }
+
+  const { url: signedUrl } = JSON.parse(urlText);
+
+  const chatRes = await fetch("https://api.mistral.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: MISTRAL_VISION_MODEL,
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text:
+              "Extrahiere den vollständigen Text dieses Belegfotos als Markdown. Gib nur den erkannten Text zurück, ohne Kommentare oder Erklärungen.",
+          },
+          { type: "image_url", image_url: signedUrl },
+        ],
+      }],
+    }),
+  });
+  const chatText = await chatRes.text();
+
+  fetch(`https://api.mistral.ai/v1/files/${fileId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
+  }).catch(() => {});
+
+  if (!chatRes.ok) {
+    return jsonResponse({
+      error: "Mistral vision OCR failed",
+      status: chatRes.status,
+      response: chatText.slice(0, 1000),
+    }, chatRes.status);
+  }
+
+  const data = JSON.parse(chatText);
+  return jsonResponse({
+    success: true,
+    text: data.choices?.[0]?.message?.content || "",
+    model: data.model,
+    size: imageBytes.length,
+  });
+}
+
+async function handleDecryptBlob(body: Record<string, string>) {
+  const { blobBase64, blobKey } = body;
+  if (!blobBase64 || !blobKey) {
+    return jsonResponse({ error: "Missing blobBase64 or blobKey" }, 400);
+  }
+
+  const encrypted = Uint8Array.from(atob(blobBase64), (c) => c.charCodeAt(0));
+  const key = hexToBytes(blobKey);
+  const nonce = new Uint8Array(24);
+  nonce[23] = 0x01;
+
+  const decrypted = nacl.secretbox.open(encrypted, nonce, key);
+  if (!decrypted) {
+    return jsonResponse({ error: "Blob decryption failed" }, 400);
+  }
+
+  const imageBase64 = bytesToBase64(decrypted);
+  return jsonResponse({
+    success: true,
+    imageBase64,
+    size: decrypted.length,
+  });
+}
+
+async function handleDecryptBlobAndOcr(body: Record<string, string>) {
+  const { blobBase64, blobKey } = body;
+  if (!blobBase64 || !blobKey) {
+    return jsonResponse({ error: "Missing blobBase64 or blobKey" }, 400);
+  }
+
+  const encrypted = Uint8Array.from(atob(blobBase64), (c) => c.charCodeAt(0));
+  const key = hexToBytes(blobKey);
+  const nonce = new Uint8Array(24);
+  nonce[23] = 0x01;
+
+  const decrypted = nacl.secretbox.open(encrypted, nonce, key);
+  if (!decrypted) {
+    return jsonResponse({ error: "Blob decryption failed" }, 400);
+  }
+
+  return mistralOcrFromImageBytes(decrypted);
+}
+
+async function handleVisionOcr(body: Record<string, string>) {
+  if (!MISTRAL_API_KEY) {
+    return jsonResponse({ error: "MISTRAL_API_KEY not configured" }, 500);
+  }
+
+  const { imageBase64 } = body;
+  if (!imageBase64) {
+    return jsonResponse({ error: "Missing imageBase64" }, 400);
+  }
+
+  const imageBytes = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
+  return mistralOcrFromImageBytes(imageBytes);
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function storageAuthHeaders(contentType?: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    apikey: SUPABASE_SERVICE_KEY,
+  };
+  // Legacy JWT service_role keys need Bearer; neue sb_secret_* nur apikey
+  if (SUPABASE_SERVICE_KEY.startsWith("eyJ")) {
+    headers.Authorization = `Bearer ${SUPABASE_SERVICE_KEY}`;
+  }
+  if (contentType) headers["Content-Type"] = contentType;
+  return headers;
+}
+
+async function downloadFromStorage(storagePath: string): Promise<Uint8Array> {
+  const res = await fetch(
+    `${SUPABASE_URL}/storage/v1/object/${BELEGE_BUCKET}/${storagePath}`,
+    { headers: storageAuthHeaders() },
+  );
+  if (!res.ok) {
+    throw new Error(`Storage download failed: ${storagePath} (${res.status})`);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+async function handleArchiveBelegSeite(body: Record<string, string>) {
+  const { mandantId, imageBase64, seiteNr, mimeType = "image/jpeg" } = body;
+  if (!mandantId || !imageBase64) {
+    return jsonResponse({ error: "Missing mandantId or imageBase64" }, 400);
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return jsonResponse({ error: "Supabase service credentials not configured" }, 500);
+  }
+
+  const bytes = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
+  const gobdHash = await sha256Hex(bytes);
+  const page = String(seiteNr || "1");
+  const ext = mimeType.includes("png") ? "png" : "jpg";
+  const storagePath = `${mandantId}/${crypto.randomUUID()}-s${page}.${ext}`;
+
+  const uploadRes = await fetch(
+    `${SUPABASE_URL}/storage/v1/object/${BELEGE_BUCKET}/${storagePath}`,
+    {
+      method: "POST",
+      headers: {
+        ...storageAuthHeaders(mimeType),
+        "x-upsert": "false",
+      },
+      body: bytes,
+    },
+  );
+  const uploadText = await uploadRes.text();
+  if (!uploadRes.ok) {
+    return jsonResponse({
+      error: "Storage upload failed",
+      status: uploadRes.status,
+      response: uploadText.slice(0, 500),
+    }, uploadRes.status);
+  }
+
+  return jsonResponse({
+    success: true,
+    storagePath,
+    gobdHash,
+    seiteNr: Number(page),
+    mimeType,
+  });
+}
+
+async function handleOcrStoragePages(body: Record<string, unknown>) {
+  const paths = body.storagePaths;
+  if (!Array.isArray(paths) || paths.length === 0) {
+    return jsonResponse({ error: "Missing storagePaths array" }, 400);
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return jsonResponse({ error: "Supabase service credentials not configured" }, 500);
+  }
+
+  const parts: string[] = [];
+  for (let i = 0; i < paths.length; i++) {
+    const storagePath = String(paths[i]);
+    const bytes = await downloadFromStorage(storagePath);
+    const ocr = await mistralOcrFromImageBytes(
+      bytes,
+      `beleg-s${i + 1}.jpg`,
+    );
+    if (ocr.status !== 200) {
+      return ocr;
+    }
+    const data = await ocr.json();
+    parts.push(`--- Seite ${i + 1} ---\n${data.text || ""}`);
+  }
+
+  return jsonResponse({
+    success: true,
+    text: parts.join("\n\n"),
+    pageCount: paths.length,
+  });
+}
+
+async function handleMistralChat(body: Record<string, unknown>) {
+  if (!MISTRAL_API_KEY) {
+    return jsonResponse({ error: "MISTRAL_API_KEY not configured" }, 500);
+  }
+
+  const chatBody = body.body;
+  if (!chatBody || typeof chatBody !== "object") {
+    return jsonResponse({ error: "Missing body" }, 400);
+  }
+
+  const response = await fetch("https://api.mistral.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(chatBody),
+  });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    return jsonResponse({
+      error: "Mistral chat failed",
+      status: response.status,
+      response: responseText.slice(0, 1000),
+    }, response.status);
+  }
+
+  return new Response(responseText, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders(),
+    },
+  });
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers: corsHeaders() });
+  }
+
+  if (req.method !== "POST") {
+    return jsonResponse({ error: "Method not allowed" }, 405);
+  }
+
+  if (!isAuthorized(req)) {
+    return jsonResponse({ error: "Unauthorized" }, 401);
+  }
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = await req.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+
+  const action = payload.action;
+  if (action === "decrypt") {
+    return handleDecrypt(payload as Record<string, string>);
+  }
+  if (action === "send") {
+    return handleSend(payload as Record<string, string>);
+  }
+  if (action === "decrypt-blob") {
+    return handleDecryptBlob(payload as Record<string, string>);
+  }
+  if (action === "decrypt-blob-and-ocr") {
+    return handleDecryptBlobAndOcr(payload as Record<string, string>);
+  }
+  if (action === "vision-ocr") {
+    return handleVisionOcr(payload as Record<string, string>);
+  }
+  if (action === "mistral-chat") {
+    return handleMistralChat(payload);
+  }
+  if (action === "archive-beleg-seite") {
+    return handleArchiveBelegSeite(payload as Record<string, string>);
+  }
+  if (action === "ocr-storage-pages") {
+    return handleOcrStoragePages(payload);
+  }
+
+  return jsonResponse({ error: "Unknown action" }, 400);
+});
