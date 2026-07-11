@@ -360,6 +360,8 @@ async function handleArchiveBelegSeite(body: Record<string, string>) {
     gobdHash,
     seiteNr: Number(page),
     mimeType,
+    // GoBD-Archivierungszeitstempel: Zeitpunkt des erfolgreichen Uploads
+    archivedAt: new Date().toISOString(),
   });
 }
 
