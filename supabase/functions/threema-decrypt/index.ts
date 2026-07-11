@@ -144,6 +144,25 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+/** Direkt nach dem Upload liefert Mistral sporadisch 404 auf /files/{id}/url — mit Backoff neu versuchen. */
+async function mistralSignedUrlWithRetry(
+  fileId: string,
+): Promise<{ ok: boolean; status: number; text: string }> {
+  let status = 0;
+  let text = "";
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const res = await fetch(`https://api.mistral.ai/v1/files/${fileId}/url`, {
+      headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
+    });
+    status = res.status;
+    text = await res.text();
+    if (res.ok) return { ok: true, status, text };
+    if (res.status !== 404) break;
+    await new Promise((r) => setTimeout(r, attempt * 1000));
+  }
+  return { ok: false, status, text };
+}
+
 async function mistralOcrFromImageBytes(
   imageBytes: Uint8Array,
   fileName = "beleg.jpg",
@@ -173,19 +192,16 @@ async function mistralOcrFromImageBytes(
   const uploaded = JSON.parse(uploadText);
   const fileId = uploaded.id as string;
 
-  const urlRes = await fetch(`https://api.mistral.ai/v1/files/${fileId}/url`, {
-    headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
-  });
-  const urlText = await urlRes.text();
-  if (!urlRes.ok) {
+  const urlAttempt = await mistralSignedUrlWithRetry(fileId);
+  if (!urlAttempt.ok) {
     return jsonResponse({
       error: "Mistral signed URL failed",
-      status: urlRes.status,
-      response: urlText.slice(0, 1000),
-    }, urlRes.status);
+      status: urlAttempt.status,
+      response: urlAttempt.text.slice(0, 1000),
+    }, urlAttempt.status);
   }
 
-  const { url: signedUrl } = JSON.parse(urlText);
+  const { url: signedUrl } = JSON.parse(urlAttempt.text);
 
   const chatRes = await fetch("https://api.mistral.ai/v1/chat/completions", {
     method: "POST",
@@ -504,18 +520,15 @@ async function handleOcrStoragePdf(body: Record<string, string>) {
   }
   const fileId = JSON.parse(uploadText).id as string;
 
-  const urlRes = await fetch(`https://api.mistral.ai/v1/files/${fileId}/url`, {
-    headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
-  });
-  const urlText = await urlRes.text();
-  if (!urlRes.ok) {
+  const urlAttempt = await mistralSignedUrlWithRetry(fileId);
+  if (!urlAttempt.ok) {
     return jsonResponse({
       error: "Mistral signed URL failed",
-      status: urlRes.status,
-      response: urlText.slice(0, 1000),
-    }, urlRes.status);
+      status: urlAttempt.status,
+      response: urlAttempt.text.slice(0, 1000),
+    }, urlAttempt.status);
   }
-  const { url: signedUrl } = JSON.parse(urlText);
+  const { url: signedUrl } = JSON.parse(urlAttempt.text);
 
   const ocrRes = await fetch("https://api.mistral.ai/v1/ocr", {
     method: "POST",
