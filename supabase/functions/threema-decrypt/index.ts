@@ -388,6 +388,175 @@ async function handleArchiveBelegSeite(body: Record<string, string>) {
   });
 }
 
+/** BER-90: Original-PDF unverändert archivieren (GoBD-Original, Hash über Originaldatei). */
+async function handleArchiveBelegPdf(body: Record<string, string>) {
+  const { mandantId, pdfBase64, fileName = "import.pdf" } = body;
+  if (!mandantId || !pdfBase64) {
+    return jsonResponse({ error: "Missing mandantId or pdfBase64" }, 400);
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return jsonResponse({ error: "Supabase service credentials not configured" }, 500);
+  }
+
+  const bytes = Uint8Array.from(atob(pdfBase64), (c) => c.charCodeAt(0));
+
+  // Magic Bytes %PDF-
+  if (
+    bytes.length < 5 || bytes[0] !== 0x25 || bytes[1] !== 0x50 ||
+    bytes[2] !== 0x44 || bytes[3] !== 0x46 || bytes[4] !== 0x2d
+  ) {
+    return jsonResponse({ error: "Datei ist kein gültiges PDF" }, 422);
+  }
+
+  // Strukturvalidierung + Seitenzahl
+  let pageCount = 0;
+  try {
+    const { PDFDocument } = await import("npm:pdf-lib@1.17.1");
+    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    pageCount = doc.getPageCount();
+  } catch (_e) {
+    return jsonResponse({ error: "PDF ist beschädigt oder nicht lesbar" }, 422);
+  }
+
+  const gobdHash = await sha256Hex(bytes);
+
+  // Duplikat-Check vor Upload — spart Storage-Objekt und OCR-Kosten
+  const dupRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/belege?mandant_id=eq.${mandantId}&gobd_hash=eq.${gobdHash}&select=beleg_nr&limit=1`,
+    { headers: storageAuthHeaders() },
+  );
+  if (dupRes.ok) {
+    const dup = await dupRes.json();
+    if (Array.isArray(dup) && dup.length > 0) {
+      return jsonResponse({
+        error: `Duplikat: bereits archiviert als ${dup[0].beleg_nr}`,
+        duplicate: true,
+      }, 409);
+    }
+  }
+
+  const storagePath = `${mandantId}/${crypto.randomUUID()}-${
+    fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80)
+  }`;
+
+  const uploadRes = await fetch(
+    `${SUPABASE_URL}/storage/v1/object/${BELEGE_BUCKET}/${storagePath}`,
+    {
+      method: "POST",
+      headers: {
+        ...storageAuthHeaders("application/pdf"),
+        "x-upsert": "false",
+      },
+      body: bytes,
+    },
+  );
+  const uploadText = await uploadRes.text();
+  if (!uploadRes.ok) {
+    return jsonResponse({
+      error: "Storage upload failed",
+      status: uploadRes.status,
+      response: uploadText.slice(0, 500),
+    }, uploadRes.status);
+  }
+
+  return jsonResponse({
+    success: true,
+    storagePath,
+    gobdHash,
+    pageCount,
+    mimeType: "application/pdf",
+    archivedAt: new Date().toISOString(),
+  });
+}
+
+/** BER-90: OCR über eine archivierte PDF via Mistral OCR (alle Seiten). */
+async function handleOcrStoragePdf(body: Record<string, string>) {
+  const { storagePath } = body;
+  if (!storagePath) {
+    return jsonResponse({ error: "Missing storagePath" }, 400);
+  }
+  if (!MISTRAL_API_KEY) {
+    return jsonResponse({ error: "MISTRAL_API_KEY not configured" }, 500);
+  }
+
+  const bytes = await downloadFromStorage(storagePath);
+
+  const form = new FormData();
+  form.append("purpose", "ocr");
+  form.append(
+    "file",
+    new Blob([bytes], { type: "application/pdf" }),
+    "beleg.pdf",
+  );
+
+  const uploadRes = await fetch("https://api.mistral.ai/v1/files", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
+    body: form,
+  });
+  const uploadText = await uploadRes.text();
+  if (!uploadRes.ok) {
+    return jsonResponse({
+      error: "Mistral file upload failed",
+      status: uploadRes.status,
+      response: uploadText.slice(0, 1000),
+    }, uploadRes.status);
+  }
+  const fileId = JSON.parse(uploadText).id as string;
+
+  const urlRes = await fetch(`https://api.mistral.ai/v1/files/${fileId}/url`, {
+    headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
+  });
+  const urlText = await urlRes.text();
+  if (!urlRes.ok) {
+    return jsonResponse({
+      error: "Mistral signed URL failed",
+      status: urlRes.status,
+      response: urlText.slice(0, 1000),
+    }, urlRes.status);
+  }
+  const { url: signedUrl } = JSON.parse(urlText);
+
+  const ocrRes = await fetch("https://api.mistral.ai/v1/ocr", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "mistral-ocr-latest",
+      document: { type: "document_url", document_url: signedUrl },
+    }),
+  });
+  const ocrText = await ocrRes.text();
+
+  fetch(`https://api.mistral.ai/v1/files/${fileId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
+  }).catch(() => {});
+
+  if (!ocrRes.ok) {
+    return jsonResponse({
+      error: "Mistral OCR failed",
+      status: ocrRes.status,
+      response: ocrText.slice(0, 1000),
+    }, ocrRes.status);
+  }
+
+  const data = JSON.parse(ocrText);
+  const pages = Array.isArray(data.pages) ? data.pages : [];
+  const text = pages
+    .map((p: { index?: number; markdown?: string }, i: number) =>
+      `--- Seite ${(p.index ?? i) + 1} ---\n${p.markdown || ""}`)
+    .join("\n\n");
+
+  return jsonResponse({
+    success: true,
+    text,
+    pageCount: pages.length,
+  });
+}
+
 async function handleOcrStoragePages(body: Record<string, unknown>) {
   const paths = body.storagePaths;
   if (!Array.isArray(paths) || paths.length === 0) {
@@ -500,6 +669,12 @@ Deno.serve(async (req) => {
   }
   if (action === "ocr-storage-pages") {
     return handleOcrStoragePages(payload);
+  }
+  if (action === "archive-beleg-pdf") {
+    return handleArchiveBelegPdf(payload as Record<string, string>);
+  }
+  if (action === "ocr-storage-pdf") {
+    return handleOcrStoragePdf(payload as Record<string, string>);
   }
 
   return jsonResponse({ error: "Unknown action" }, 400);
