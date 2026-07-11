@@ -35,7 +35,7 @@ Optional:
 Voraussetzung: Supabase CLI installiert und eingeloggt.
 
 ```bash
-cd /Users/Shared/Entwicklung/projekte/threema-decrypt
+cd /Users/Shared/Projekte/Entwicklung/projekte/threema-decrypt
 supabase login
 supabase link --project-ref xuqefeewzdvjhuquciut
 supabase functions deploy threema-decrypt
