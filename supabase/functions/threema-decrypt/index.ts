@@ -419,6 +419,22 @@ async function handleArchiveBelegPdf(body: Record<string, string>) {
   }
 
   const gobdHash = await sha256Hex(bytes);
+
+  // Duplikat-Check vor Upload — spart Storage-Objekt und OCR-Kosten
+  const dupRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/belege?mandant_id=eq.${mandantId}&gobd_hash=eq.${gobdHash}&select=beleg_nr&limit=1`,
+    { headers: storageAuthHeaders() },
+  );
+  if (dupRes.ok) {
+    const dup = await dupRes.json();
+    if (Array.isArray(dup) && dup.length > 0) {
+      return jsonResponse({
+        error: `Duplikat: bereits archiviert als ${dup[0].beleg_nr}`,
+        duplicate: true,
+      }, 409);
+    }
+  }
+
   const storagePath = `${mandantId}/${crypto.randomUUID()}-${
     fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80)
   }`;
