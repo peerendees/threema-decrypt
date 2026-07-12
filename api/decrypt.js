@@ -50,8 +50,58 @@ export default async function handler(req, res) {
     return handleVisionOcr(req, res);
   } else if (action === 'mistral-chat') {
     return handleMistralChat(req, res);
+  } else if (action === 'send_simple') {
+    return handleSendSimple(req, res);
   } else {
     return res.status(400).json({ error: 'Unknown action' });
+  }
+}
+
+// EINFACHER VERSAND (Basic Mode via *BERENT1) — Secrets ausschliesslich aus Env,
+// nie aus dem Request-Body. Genutzt vom KI-Betriebssystem (Skill Executor,
+// Postfach-Durchsicht) fuer Klartext-Benachrichtigungen an Marcus.
+async function handleSendSimple(req, res) {
+  const { to, text } = req.body;
+  const gatewayId = process.env.THREEMA_GATEWAY_ID_BASIC;
+  const gatewaySecret = process.env.THREEMA_SECRET_BERENT1;
+
+  if (!to || !text) {
+    return res.status(400).json({ error: 'Missing parameters' });
+  }
+  if (!gatewayId || !gatewaySecret) {
+    return res.status(500).json({ error: 'Gateway env not configured' });
+  }
+
+  try {
+    const params = new URLSearchParams({
+      from: gatewayId,
+      to: to,
+      secret: gatewaySecret,
+      text: text,
+    });
+
+    const response = await fetch('https://msgapi.threema.ch/send_simple', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+
+    const responseText = await response.text();
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error: 'Threema API error',
+        status: response.status,
+        response: responseText,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      messageId: responseText.trim(),
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Send error', message: error.message });
   }
 }
 
