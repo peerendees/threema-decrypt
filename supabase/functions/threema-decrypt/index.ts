@@ -692,6 +692,8 @@ async function handleBewirtungDeckblatt(body: Record<string, unknown>) {
   zeile("Gaststätte / Ort", angaben.lieferant);
   zeile("Rechnungsbetrag (brutto)", angaben.betrag_brutto);
   zeile("davon MwSt", angaben.mwst);
+  zeile("Trinkgeld", angaben.trinkgeld);
+  zeile("Gesamtaufwand", angaben.gesamt);
   zeile("Anlass der Bewirtung", angaben.anlass);
   zeile("Bewirtete Personen", angaben.teilnehmer);
   zeile("SKR04-Konto", angaben.sachkonto);
