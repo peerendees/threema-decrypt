@@ -641,19 +641,29 @@ async function handleMistralChat(body: Record<string, unknown>) {
 }
 
 /**
- * BER-99: Bewirtungs-Deckblatt. Erzeugt ein selbsttragendes PDF —
- * Kopfseite mit den Pflichtangaben (§ 4 Abs. 5 Nr. 2 EStG) + die Original-
+ * BER-99/BER-107: Deckblatt (Bewirtung oder Auswärtstermin). Erzeugt ein
+ * selbsttragendes PDF — Kopfseite mit den übergebenen Angaben + die Original-
  * Belegseiten (Bilder eingebettet, PDF-Seiten kopiert). Storage-Zugriff läuft
- * hier über den Service Key; die App liefert nur die (RLS-geprüften) Metadaten.
+ * hier über den Service Key; die App liefert die (RLS-geprüften) Metadaten inkl.
+ * Titel, Feldliste (Label/Wert) und Fußnote — so teilen sich Bewirtungs- und
+ * Termin-Deckblatt denselben Renderer.
  */
-async function handleBewirtungDeckblatt(body: Record<string, unknown>) {
-  const angaben = (body.angaben ?? {}) as Record<string, string>;
+async function handleDeckblatt(body: Record<string, unknown>) {
+  const angaben = (body.angaben ?? {}) as Record<string, unknown>;
   const seiten = Array.isArray(body.seiten)
     ? (body.seiten as Array<{ storage_path: string; mime_type?: string }>)
     : [];
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     return jsonResponse({ error: "Supabase service credentials not configured" }, 500);
   }
+
+  const titel = String(angaben.titel ?? "Beleg-Deckblatt");
+  const untertitel = angaben.untertitel ? String(angaben.untertitel) : "";
+  const felder = Array.isArray(angaben.felder)
+    ? (angaben.felder as Array<[string, string]>)
+    : [];
+  const fusszeile = angaben.fusszeile ? String(angaben.fusszeile) : "";
+  const erstellt = String(angaben.erstellt ?? "");
 
   const { PDFDocument, StandardFonts, rgb } = await import("npm:pdf-lib@1.17.1");
   const doc = await PDFDocument.create();
@@ -662,14 +672,17 @@ async function handleBewirtungDeckblatt(body: Record<string, unknown>) {
   const A4: [number, number] = [595.28, 841.89];
   const gold = rgb(0.71, 0.455, 0.165);
   const dark = rgb(0.1, 0.08, 0.06);
+  const muted = rgb(0.48, 0.42, 0.35);
 
   // ---- Kopfseite ----
   const cover = doc.addPage(A4);
   let y = 800;
   cover.drawText("+", { x: 50, y: y - 4, size: 34, font: bold, color: gold });
-  cover.drawText("Bewirtungsbeleg", { x: 82, y, size: 24, font: bold, color: dark });
+  cover.drawText(titel, { x: 82, y, size: 24, font: bold, color: dark });
   y -= 26;
-  cover.drawText("Angaben nach § 4 Abs. 5 Nr. 2 EStG", { x: 82, y, size: 10, font, color: rgb(0.48, 0.42, 0.35) });
+  if (untertitel) {
+    cover.drawText(untertitel, { x: 82, y, size: 10, font, color: muted });
+  }
   y -= 40;
 
   const zeile = (label: string, wert: string) => {
@@ -687,28 +700,18 @@ async function handleBewirtungDeckblatt(body: Record<string, unknown>) {
     y = ly - 22;
   };
 
-  zeile("Beleg-Nr.", angaben.beleg_nr);
-  zeile("Datum der Bewirtung", angaben.beleg_datum);
-  zeile("Gaststätte / Ort", angaben.lieferant);
-  zeile("Rechnungsbetrag (brutto)", angaben.betrag_brutto);
-  zeile("davon MwSt", angaben.mwst);
-  zeile("Trinkgeld", angaben.trinkgeld);
-  zeile("Gesamtaufwand", angaben.gesamt);
-  zeile("Anlass der Bewirtung", angaben.anlass);
-  zeile("Bewirtete Personen", angaben.teilnehmer);
-  zeile("SKR04-Konto", angaben.sachkonto);
+  for (const [label, wert] of felder) zeile(label, String(wert ?? "—"));
 
   y -= 10;
   cover.drawLine({ start: { x: 50, y }, end: { x: 545, y }, thickness: 0.5, color: gold });
   y -= 20;
+  if (fusszeile) {
+    cover.drawText(fusszeile, { x: 50, y, size: 8, font, color: muted });
+    y -= 12;
+  }
   cover.drawText(
-    "Die 70/30-Aufteilung der abziehbaren Bewirtungskosten erfolgt in der Buchhaltung.",
-    { x: 50, y, size: 8, font, color: rgb(0.48, 0.42, 0.35) },
-  );
-  y -= 12;
-  cover.drawText(
-    `Erstellt: ${angaben.erstellt || ""} · BelegChat · BERENT.AI`,
-    { x: 50, y, size: 8, font, color: rgb(0.48, 0.42, 0.35) },
+    `Erstellt: ${erstellt} · BelegChat · BERENT.AI`,
+    { x: 50, y, size: 8, font, color: muted },
   );
 
   // ---- Original-Belegseiten anhängen ----
@@ -752,10 +755,11 @@ Deno.serve(async (req) => {
   }
 
   const action = payload.action;
+  const istDeckblatt = action === "bewirtung-deckblatt" || action === "termin-deckblatt";
   // Deckblatt darf mit dem eng begrenzten DECKBLATT_TOKEN aufgerufen werden;
   // alle übrigen Aktionen weiterhin nur mit dem vollen DECRYPT_API_TOKEN.
   const authed = isAuthorized(req) ||
-    (action === "bewirtung-deckblatt" && !!DECKBLATT_TOKEN && isAuthorized(req, DECKBLATT_TOKEN));
+    (istDeckblatt && !!DECKBLATT_TOKEN && isAuthorized(req, DECKBLATT_TOKEN));
   if (!authed) {
     return jsonResponse({ error: "Unauthorized" }, 401);
   }
@@ -789,8 +793,8 @@ Deno.serve(async (req) => {
   if (action === "ocr-storage-pdf") {
     return handleOcrStoragePdf(payload as Record<string, string>);
   }
-  if (action === "bewirtung-deckblatt") {
-    return handleBewirtungDeckblatt(payload);
+  if (istDeckblatt) {
+    return handleDeckblatt(payload);
   }
 
   return jsonResponse({ error: "Unknown action" }, 400);
