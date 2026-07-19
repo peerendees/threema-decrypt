@@ -657,13 +657,35 @@ async function handleDeckblatt(body: Record<string, unknown>) {
     return jsonResponse({ error: "Supabase service credentials not configured" }, 500);
   }
 
-  const titel = String(angaben.titel ?? "Beleg-Deckblatt");
-  const untertitel = angaben.untertitel ? String(angaben.untertitel) : "";
-  const felder = Array.isArray(angaben.felder)
+  let titel = String(angaben.titel ?? "Beleg-Deckblatt");
+  let untertitel = angaben.untertitel ? String(angaben.untertitel) : "";
+  let felder = Array.isArray(angaben.felder)
     ? (angaben.felder as Array<[string, string]>)
     : [];
-  const fusszeile = angaben.fusszeile ? String(angaben.fusszeile) : "";
+  let fusszeile = angaben.fusszeile ? String(angaben.fusszeile) : "";
   const erstellt = String(angaben.erstellt ?? "");
+
+  // Rückwärtskompatibel: der alte flache Aufruf (App vor dem Termin-Deckblatt)
+  // liefert keine Feldliste, sondern einzelne Bewirtungs-Schlüssel. So läuft das
+  // Bewirtungs-Deckblatt auch während des gestaffelten Deploys ohne Bruch.
+  if (felder.length === 0 && (angaben.anlass || angaben.teilnehmer || angaben.beleg_nr)) {
+    const a = angaben as Record<string, string>;
+    titel = "Bewirtungsbeleg";
+    untertitel = "Angaben nach § 4 Abs. 5 Nr. 2 EStG";
+    fusszeile = "Die 70/30-Aufteilung der abziehbaren Bewirtungskosten erfolgt in der Buchhaltung.";
+    felder = [
+      ["Beleg-Nr.", a.beleg_nr],
+      ["Datum der Bewirtung", a.beleg_datum],
+      ["Gaststätte / Ort", a.lieferant],
+      ["Rechnungsbetrag (brutto)", a.betrag_brutto],
+      ["davon MwSt", a.mwst],
+      ["Trinkgeld", a.trinkgeld],
+      ["Gesamtaufwand", a.gesamt],
+      ["Anlass der Bewirtung", a.anlass],
+      ["Bewirtete Personen", a.teilnehmer],
+      ["SKR04-Konto", a.sachkonto],
+    ].map(([l, w]) => [String(l), String(w ?? "—")] as [string, string]);
+  }
 
   const { PDFDocument, StandardFonts, rgb } = await import("npm:pdf-lib@1.17.1");
   const doc = await PDFDocument.create();
