@@ -4,7 +4,10 @@
 //   2) Absender-Public-Key ueber die Threema-Lookup-API holen
 //   3) Box entschluesseln (NaCl box.open mit unserem Private Key)
 //   4) Typ-Byte (0x01=Text) + Padding entfernen -> Klartext
-//   5) beginnt der Text mit "/beirat": an den n8n-Beirat-Webhook weiterreichen ({from, text})
+//   5) bekanntes Kommando? -> an den passenden n8n-Webhook weiterreichen ({from, text}):
+//        "/beirat …"                    -> Beirat-Orchestrator
+//        "idee …" / "ideenparkplatz …"  -> Skill Executor (Skill donna/idee)
+//      Alles andere wird ignoriert.
 // Threema bekommt IMMER schnell 200 (sonst Retries). Fehler werden geloggt, nicht geworfen.
 //
 // Env (in Vercel setzen, sobald *BERENTB aktiv ist):
@@ -12,6 +15,7 @@
 //   THREEMA_SECRET_BERENTB      = API-Secret der Gateway-ID
 //   THREEMA_PRIVATE_KEY_BERENTB  = Private Key (64 hex)
 //   N8N_BEIRAT_WEBHOOK          = optional; Default unten
+//   N8N_SKILL_WEBHOOK           = optional; Default unten
 
 import nacl from 'tweetnacl';
 import crypto from 'node:crypto';
@@ -21,6 +25,26 @@ const API_SECRET = process.env.THREEMA_SECRET_BERENTB || '';
 const PRIVATE_KEY = process.env.THREEMA_PRIVATE_KEY_BERENTB || '';
 const N8N_WEBHOOK = process.env.N8N_BEIRAT_WEBHOOK
   || 'https://n8n.srv1098810.hstgr.cloud/webhook/berent-beirat-orchestrator-7f2e9c1a';
+const N8N_SKILL_WEBHOOK = process.env.N8N_SKILL_WEBHOOK
+  || 'https://n8n.srv1098810.hstgr.cloud/webhook/berent-skill-executor-4e21b7d0';
+
+// Kommando-Router. Reihenfolge = Prioritaet; der erste Treffer gewinnt.
+//
+// "idee" steht bewusst OHNE Schraegstrich: unterwegs zaehlt jeder Tastendruck, und
+// ein Praefix-Zeichen ist auf der Handytastatur teuer. Der Skill Executor erkennt den
+// Skill ohnehin ueber seine trigger_keywords — das Kommando hier muss nur entscheiden,
+// an WELCHEN Webhook der Text geht.
+//
+// \b nach "idee" wuerde "ideenparkplatz" NICHT treffen (n ist ein Wortzeichen),
+// deshalb beide Formen ausgeschrieben. Danach ist ein Wortende noetig, damit
+// "ideensammlung" o. ae. nicht versehentlich hier landet.
+//
+// Der fuehrende Schraegstrich ist optional: wer "/beirat" gewohnt ist, tippt leicht
+// auch "/idee". Das stillschweigend zu verwerfen waere die schlechteste Antwort.
+const KOMMANDOS = [
+  { muster: /^\/beirat\b/i, ziel: N8N_WEBHOOK, name: 'beirat' },
+  { muster: /^\/?(?:idee|ideenparkplatz)\b/i, ziel: N8N_SKILL_WEBHOOK, name: 'idee' },
+];
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
@@ -79,14 +103,15 @@ export default async function handler(req, res) {
     const padLen = decrypted[decrypted.length - 1];
     const text = Buffer.from(decrypted.slice(1, decrypted.length - padLen)).toString('utf8').trim();
 
-    // 5) Nur /beirat-Kommandos weiterreichen; alles andere ignorieren.
-    if (/^\/beirat\b/i.test(text)) {
-      const r = await fetch(N8N_WEBHOOK, {
+    // 5) Bekanntes Kommando weiterreichen; alles andere stillschweigend ignorieren.
+    const kommando = KOMMANDOS.find((k) => k.muster.test(text));
+    if (kommando) {
+      const r = await fetch(kommando.ziel, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ from, text }),
       });
-      if (!r.ok) console.error('[beirat-callback] n8n-Webhook ' + r.status);
+      if (!r.ok) console.error(`[beirat-callback] n8n-Webhook (${kommando.name}) ` + r.status);
     }
   } catch (e) {
     console.error('[beirat-callback] Verarbeitung:', e.message);
