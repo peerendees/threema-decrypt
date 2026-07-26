@@ -336,9 +336,9 @@ async function handleSend(req, res) {
 // SENDEN als *BERENTB (E2E) — Antwort des Beirat-Bots. Keys aus Env, Empfaenger-Pubkey per Lookup.
 async function handleSendBeirat(req, res) {
   const { to, text } = req.body;
-  const gatewayId = process.env.THREEMA_GATEWAY_ID_BEIRAT;
+  const gatewayId = process.env.THREEMA_GATEWAY_ID_BERENTB;
   const gatewaySecret = process.env.THREEMA_SECRET_BERENTB;
-  const gatewayPrivateKey = process.env.THREEMA_PRIVATE_KEY_BEIRAT;
+  const gatewayPrivateKey = process.env.THREEMA_PRIVATE_KEY_BERENTB;
 
   if (!to || !text) return res.status(400).json({ error: 'Missing parameters' });
   if (!gatewayId || !gatewaySecret || !gatewayPrivateKey) {
