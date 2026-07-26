@@ -8,17 +8,17 @@
 // Threema bekommt IMMER schnell 200 (sonst Retries). Fehler werden geloggt, nicht geworfen.
 //
 // Env (in Vercel setzen, sobald *BERENTB aktiv ist):
-//   THREEMA_GATEWAY_ID_BEIRAT   = *BERENTB
+//   THREEMA_GATEWAY_ID_BERENTB   = *BERENTB
 //   THREEMA_SECRET_BERENTB      = API-Secret der Gateway-ID
-//   THREEMA_PRIVATE_KEY_BEIRAT  = Private Key (64 hex)
+//   THREEMA_PRIVATE_KEY_BERENTB  = Private Key (64 hex)
 //   N8N_BEIRAT_WEBHOOK          = optional; Default unten
 
 import nacl from 'tweetnacl';
 import crypto from 'node:crypto';
 
-const GATEWAY_ID = process.env.THREEMA_GATEWAY_ID_BEIRAT || '';
+const GATEWAY_ID = process.env.THREEMA_GATEWAY_ID_BERENTB || '';
 const API_SECRET = process.env.THREEMA_SECRET_BERENTB || '';
-const PRIVATE_KEY = process.env.THREEMA_PRIVATE_KEY_BEIRAT || '';
+const PRIVATE_KEY = process.env.THREEMA_PRIVATE_KEY_BERENTB || '';
 const N8N_WEBHOOK = process.env.N8N_BEIRAT_WEBHOOK
   || 'https://n8n.srv1098810.hstgr.cloud/webhook/berent-beirat-orchestrator-7f2e9c1a';
 
