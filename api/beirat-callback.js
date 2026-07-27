@@ -19,10 +19,17 @@
 
 import nacl from 'tweetnacl';
 import crypto from 'node:crypto';
+import { sendeE2E } from '../lib/threema-e2e.js';
 
 const GATEWAY_ID = process.env.THREEMA_GATEWAY_ID_BERENTB || '';
 const API_SECRET = process.env.THREEMA_SECRET_BERENTB || '';
 const PRIVATE_KEY = process.env.THREEMA_PRIVATE_KEY_BERENTB || '';
+
+// Wer an *BERENTB schreiben darf. Die MAC-Pruefung belegt nur, dass die Nachricht
+// wirklich von Threema kommt — nicht, WER sie geschrieben hat. Jeder mit der
+// Gateway-ID koennte sonst Skills ausloesen. Default: nur Marcus.
+const ERLAUBTE_ABSENDER = (process.env.BERENTB_ERLAUBTE_ABSENDER || 'BUMFMZ39')
+  .split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
 const N8N_WEBHOOK = process.env.N8N_BEIRAT_WEBHOOK
   || 'https://n8n.srv1098810.hstgr.cloud/webhook/berent-beirat-orchestrator-7f2e9c1a';
 const N8N_SKILL_WEBHOOK = process.env.N8N_SKILL_WEBHOOK
@@ -80,6 +87,13 @@ export default async function handler(req, res) {
     return res.status(200).send('ok');
   }
 
+  // Absender pruefen. Die MAC sagt nur "kommt echt von Threema" — nicht von WEM.
+  // Ohne diese Schranke koennte jeder, der die Gateway-ID kennt, Skills ausloesen.
+  if (!ERLAUBTE_ABSENDER.includes(String(from).toUpperCase())) {
+    console.error('[beirat-callback] Absender nicht zugelassen: ' + from);
+    return res.status(200).send('ok');      // 200, damit Threema nicht wiederholt
+  }
+
   // Ab hier verifiziert. Best-effort verarbeiten, Threema immer 200 geben.
   try {
     // 2) Absender-Public-Key holen.
@@ -99,7 +113,15 @@ export default async function handler(req, res) {
     if (!decrypted) throw new Error('Entschluesselung fehlgeschlagen');
 
     // 4) Nur Textnachrichten (Typ 0x01); Typ-Byte + Padding entfernen.
-    if (decrypted[0] !== 0x01) return res.status(200).send('ok');
+    //    Alles andere — vor allem echte Sprachnachrichten (0x14) — wurde bisher
+    //    STILL verworfen: Marcus haette nie erfahren, warum nichts passiert.
+    //    Jetzt eine kurze Antwort. Audio-Transkription ist bewusst nicht Teil von P4.
+    if (decrypted[0] !== 0x01) {
+      const ergebnis = await sendeE2E(from,
+        'Das kann ich noch nicht lesen — bitte als Text schicken (Diktat auf der Tastatur reicht).');
+      if (!ergebnis.ok) console.error('[beirat-callback] Hinweis-Antwort: ' + ergebnis.fehler);
+      return res.status(200).send('ok');
+    }
     const padLen = decrypted[decrypted.length - 1];
     const text = Buffer.from(decrypted.slice(1, decrypted.length - padLen)).toString('utf8').trim();
 
@@ -109,7 +131,10 @@ export default async function handler(req, res) {
       const r = await fetch(kommando.ziel, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from, text }),
+        // kanal sagt dem Executor, WOHIN die Antwort gehoert — ohne ihn landet sie
+        // im *BERENT1-Chat, also woanders als die Frage. messageId dient spaeter
+        // (P6) der Idempotenz, wenn Threema eine Zustellung wiederholt.
+        body: JSON.stringify({ from, text, kanal: 'berentb', messageId }),
       });
       if (!r.ok) console.error(`[beirat-callback] n8n-Webhook (${kommando.name}) ` + r.status);
     }
