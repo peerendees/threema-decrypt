@@ -112,18 +112,16 @@ export default async function handler(req, res) {
     );
     if (!decrypted) throw new Error('Entschluesselung fehlgeschlagen');
 
-    // 4) Nur Textnachrichten (Typ 0x01); Typ-Byte + Padding entfernen.
-    //    Alles andere — vor allem echte Sprachnachrichten (0x14) — wurde bisher
-    //    STILL verworfen: Marcus haette nie erfahren, warum nichts passiert.
-    //    Jetzt eine kurze Antwort. Audio-Transkription ist bewusst nicht Teil von P4.
-    if (decrypted[0] !== 0x01) {
-      const ergebnis = await sendeE2E(from,
-        'Das kann ich noch nicht lesen — bitte als Text schicken (Diktat auf der Tastatur reicht).');
-      if (!ergebnis.ok) console.error('[beirat-callback] Hinweis-Antwort: ' + ergebnis.fehler);
-      return res.status(200).send('ok');
-    }
-    const padLen = decrypted[decrypted.length - 1];
-    const text = Buffer.from(decrypted.slice(1, decrypted.length - padLen)).toString('utf8').trim();
+    // 4) Nur Textnachrichten (Typ 0x01); alles andere STILL verwerfen.
+    //
+    //    NOTBREMSE 27.07.2026: Hier stand kurzzeitig eine Hinweis-Antwort fuer
+    //    Nicht-Text. Das erzeugte eine Endlosschleife — die Threema-App quittiert
+    //    JEDE zugestellte Nachricht mit einer Empfangsbestaetigung (Typ 0x80), die
+    //    hier wieder als "Nicht-Text" ankommt: Hinweis -> Quittung -> Hinweis -> ...
+    //    Eine Antwort auf Nicht-Text darf es nur geben, wenn vorher sauber nach
+    //    Nachrichtentyp gefiltert wird (Quittungen 0x80, Tipp-Anzeigen 0x90
+    //    ausgenommen) UND eine Wiederholsperre greift.
+    if (decrypted[0] !== 0x01) return res.status(200).send('ok');
 
     // 5) Bekanntes Kommando weiterreichen; alles andere stillschweigend ignorieren.
     const kommando = KOMMANDOS.find((k) => k.muster.test(text));
