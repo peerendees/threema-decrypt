@@ -1,4 +1,5 @@
 import nacl from 'tweetnacl';
+import { sendeE2E } from '../lib/threema-e2e.js';
 import crypto from 'node:crypto';
 
 // Erlaubte Origin für CORS. Für reine Server-zu-Server-Aufrufe (n8n) bleibt das leer,
@@ -335,61 +336,14 @@ async function handleSend(req, res) {
 
 // SENDEN als *BERENTB (E2E) — Antwort des Beirat-Bots. Keys aus Env, Empfaenger-Pubkey per Lookup.
 async function handleSendBeirat(req, res) {
+  // Duenne Huelle um lib/threema-e2e.js — die Krypto liegt dort, damit sie auch der
+  // Threema-Callback nutzen kann, ohne dass es zwei Fassungen davon gibt.
   const { to, text } = req.body;
-  const gatewayId = process.env.THREEMA_GATEWAY_ID_BERENTB;
-  const gatewaySecret = process.env.THREEMA_SECRET_BERENTB;
-  const gatewayPrivateKey = process.env.THREEMA_PRIVATE_KEY_BERENTB;
-
-  if (!to || !text) return res.status(400).json({ error: 'Missing parameters' });
-  if (!gatewayId || !gatewaySecret || !gatewayPrivateKey) {
-    return res.status(500).json({ error: 'Beirat gateway env not configured' });
+  const ergebnis = await sendeE2E(to, text);
+  if (!ergebnis.ok) {
+    return res.status(ergebnis.status).json({ error: ergebnis.fehler });
   }
-
-  try {
-    const pkRes = await fetch(
-      `https://msgapi.threema.ch/pubkeys/${encodeURIComponent(to)}?from=${encodeURIComponent(gatewayId)}&secret=${encodeURIComponent(gatewaySecret)}`,
-    );
-    if (!pkRes.ok) {
-      return res.status(502).json({ error: 'pubkey lookup failed', status: pkRes.status });
-    }
-    const recipientPublicKey = (await pkRes.text()).trim();
-
-    const textBytes = new TextEncoder().encode(text);
-    const messageData = new Uint8Array(1 + textBytes.length);
-    messageData[0] = 0x01;
-    messageData.set(textBytes, 1);
-
-    let padLength = Math.floor(Math.random() * 255) + 1;
-    if (messageData.length + padLength < 32) padLength = 32 - messageData.length;
-    const paddedData = new Uint8Array(messageData.length + padLength);
-    paddedData.set(messageData);
-    paddedData.fill(padLength, messageData.length);
-
-    const nonce = nacl.randomBytes(24);
-    const encrypted = nacl.box(paddedData, nonce, hexToBytes(recipientPublicKey), hexToBytes(gatewayPrivateKey));
-
-    const params = new URLSearchParams({
-      from: gatewayId,
-      to: to,
-      secret: gatewaySecret,
-      nonce: bytesToHex(nonce),
-      box: bytesToHex(encrypted),
-    });
-
-    const response = await fetch('https://msgapi.threema.ch/send_e2e', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-    });
-
-    const responseText = await response.text();
-    if (!response.ok) {
-      return res.status(response.status).json({ error: 'Threema API error', status: response.status, response: responseText });
-    }
-    return res.status(200).json({ success: true, messageId: responseText.trim() });
-  } catch (error) {
-    return res.status(500).json({ error: 'Send error', message: error.message });
-  }
+  return res.status(200).json({ success: true, messageId: ergebnis.messageId });
 }
 
 // Hilfsfunktionen
