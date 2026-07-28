@@ -7,9 +7,10 @@
 //      unlesbaren Inhalt (Sprache/Bild/Datei) mit Hinweis beantworten,
 //      Text entpacken (Typ-Byte + Padding weg) -> Klartext
 //   5) bekanntes Kommando? -> an den passenden n8n-Webhook weiterreichen ({from, text}):
-//        "/beirat …"                    -> Beirat-Orchestrator
+//        "beirat …" / "/beirat …"       -> Beirat-Orchestrator
 //        "idee …" / "ideenparkplatz …"  -> Skill Executor (Skill donna/idee)
-//      Text ohne Kommando -> kurzer Hinweis, welche Kommandos es gibt.
+//      Text OHNE Kommando -> ebenfalls Skill Executor; der ordnet ueber
+//      trigger_keywords zu und antwortet notfalls mit system/skill-hilfe.
 // Threema bekommt IMMER schnell 200 (sonst Retries). Fehler werden geloggt, nicht geworfen.
 //
 // Env (in Vercel setzen, sobald *BERENTB aktiv ist):
@@ -51,9 +52,27 @@ const N8N_SKILL_WEBHOOK = process.env.N8N_SKILL_WEBHOOK
 // Der fuehrende Schraegstrich ist optional: wer "/beirat" gewohnt ist, tippt leicht
 // auch "/idee". Das stillschweigend zu verwerfen waere die schlechteste Antwort.
 const KOMMANDOS = [
-  { muster: /^\/beirat\b/i, ziel: N8N_WEBHOOK, name: 'beirat' },
+  { muster: /^\/?beirat\b/i, ziel: N8N_WEBHOOK, name: 'beirat' },
   { muster: /^\/?(?:idee|ideenparkplatz)\b/i, ziel: N8N_SKILL_WEBHOOK, name: 'idee' },
 ];
+
+// Alles ohne erkanntes Kommando geht an den Skill Executor. Dort steht seit jeher ein
+// Zuordner, der Skills ueber ihre trigger_keywords erkennt — auch mitten im Satz, mit
+// Wortgrenzen und Umlaut-Normalisierung. Der kam bisher nur nie zum Zug, weil hier
+// vorher abgewiesen wurde: "Donna, schreibe fuer morgen einen Termin ..." enthaelt das
+// Wort "Termin", traf aber nie ein Kommando.
+//
+// Warum das gefahrlos ist: Der Zuordner wertet die Governance-Ampel aus. ROT wird gar
+// nicht ausgefuehrt, GELB laeuft nur als Entwurf mit ausdruecklichem Hinweis. Und trifft
+// nichts, antwortet der Skill "system/skill-hilfe" mit der Liste dessen, was es gibt —
+// eine bessere Auskunft, als dieser Callback je geben koennte, weil sie aus dem echten
+// Skill-Bestand kommt statt aus einer hier gepflegten Aufzaehlung.
+//
+// Der Beirat behaelt seinen ausdruecklichen Auslöser (Schraegstrich jetzt optional). Er
+// startet ein ganzes Gremium, laeuft lange und rechnet ueber einen EIGENEN Anthropic-
+// Schluessel ab, der genau zur Kostentrennung getrennt gefuehrt wird. Was so teuer ist,
+// soll man absichtlich starten und nicht durch ein Schluesselwort hineinstolpern.
+const STANDARD_ZIEL = { ziel: N8N_SKILL_WEBHOOK, name: 'standard' };
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
@@ -157,28 +176,27 @@ export default async function handler(req, res) {
     const padLen = decrypted[decrypted.length - 1];
     const text = Buffer.from(decrypted.slice(1, decrypted.length - padLen)).toString('utf8').trim();
 
-    // 5) Bekanntes Kommando weiterreichen; alles andere stillschweigend ignorieren.
-    const kommando = KOMMANDOS.find((k) => k.muster.test(text));
-    if (kommando) {
-      const r = await fetch(kommando.ziel, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        // kanal sagt dem Executor, WOHIN die Antwort gehoert — ohne ihn landet sie
-        // im *BERENT1-Chat, also woanders als die Frage. messageId dient spaeter
-        // (P6) der Idempotenz, wenn Threema eine Zustellung wiederholt.
-        body: JSON.stringify({ from, text, kanal: 'berentb', messageId }),
-      });
-      if (!r.ok) console.error(`[beirat-callback] n8n-Webhook (${kommando.name}) ` + r.status);
-    } else {
-      // Text, aber kein bekanntes Kommando. Antworten ist hier gefahrlos: die
-      // Quittung auf unsere Antwort ist Typ 0x80 und faellt oben in den stillen
-      // Zweig — die Schleife von damals kann so nicht entstehen.
+    // 5) Weiterreichen. Kommando entscheidet nur noch, an WELCHEN Webhook — ohne
+    //    Treffer geht es an den Skill Executor, der selbst zuordnet (siehe oben).
+    const kommando = KOMMANDOS.find((k) => k.muster.test(text)) || STANDARD_ZIEL;
+    const r = await fetch(kommando.ziel, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // kanal sagt dem Executor, WOHIN die Antwort gehoert — ohne ihn landet sie
+      // im *BERENT1-Chat, also woanders als die Frage. messageId dient spaeter
+      // (P6) der Idempotenz, wenn Threema eine Zustellung wiederholt.
+      body: JSON.stringify({ from, text, kanal: 'berentb', messageId }),
+    });
+    if (!r.ok) {
+      console.error(`[beirat-callback] n8n-Webhook (${kommando.name}) ` + r.status);
+      // Nicht schweigen. Vorher fiel ein Webhook-Fehler nur ins Vercel-Protokoll,
+      // und Marcus wartete auf eine Antwort, die nie kam — dasselbe Muster, das den
+      // Kanal am 27./28.07. zwei Tage lang unbemerkt tot liegen liess.
       const hinweis = await sendeE2E(from,
-        'Das habe ich nicht verstanden. Ich kenne zwei Kommandos: "idee …" für den '
-        + 'Ideenparkplatz und "/beirat …" für den Beirat. Stell eines davon voran.',
-        'hinweis-kein-kommando');
+        'Ich konnte das gerade nicht weitergeben (' + r.status + '). Versuch es bitte gleich noch einmal.',
+        'hinweis-webhook-fehler');
       if (!hinweis.ok && !hinweis.gesperrt) {
-        console.error('[beirat-callback] Hinweis kein Kommando: ' + hinweis.fehler);
+        console.error('[beirat-callback] Hinweis Webhook-Fehler: ' + hinweis.fehler);
       }
     }
   } catch (e) {
