@@ -3,11 +3,13 @@
 //   1) MAC pruefen (HMAC-SHA256 mit API-Secret ueber from+to+messageId+date+nonce+box)
 //   2) Absender-Public-Key ueber die Threema-Lookup-API holen
 //   3) Box entschluesseln (NaCl box.open mit unserem Private Key)
-//   4) Typ-Byte (0x01=Text) + Padding entfernen -> Klartext
+//   4) Nachrichtentyp pruefen: Steuernachrichten (>= 0x80) still verwerfen,
+//      unlesbaren Inhalt (Sprache/Bild/Datei) mit Hinweis beantworten,
+//      Text entpacken (Typ-Byte + Padding weg) -> Klartext
 //   5) bekanntes Kommando? -> an den passenden n8n-Webhook weiterreichen ({from, text}):
 //        "/beirat …"                    -> Beirat-Orchestrator
 //        "idee …" / "ideenparkplatz …"  -> Skill Executor (Skill donna/idee)
-//      Alles andere wird ignoriert.
+//      Text ohne Kommando -> kurzer Hinweis, welche Kommandos es gibt.
 // Threema bekommt IMMER schnell 200 (sonst Retries). Fehler werden geloggt, nicht geworfen.
 //
 // Env (in Vercel setzen, sobald *BERENTB aktiv ist):
@@ -112,17 +114,38 @@ export default async function handler(req, res) {
     );
     if (!decrypted) throw new Error('Entschluesselung fehlgeschlagen');
 
-    // 4) Nur Textnachrichten (Typ 0x01); alles andere STILL verwerfen. Danach
-    //    Typ-Byte und Padding entfernen -> Klartext.
+    // 4) Nachrichtentyp auswerten.
     //
     //    NOTBREMSE 27.07.2026: Hier stand kurzzeitig eine Hinweis-Antwort fuer
-    //    Nicht-Text. Das erzeugte eine Endlosschleife — die Threema-App quittiert
-    //    JEDE zugestellte Nachricht mit einer Empfangsbestaetigung (Typ 0x80), die
-    //    hier wieder als "Nicht-Text" ankommt: Hinweis -> Quittung -> Hinweis -> ...
-    //    Eine Antwort auf Nicht-Text darf es nur geben, wenn vorher sauber nach
-    //    Nachrichtentyp gefiltert wird (Quittungen 0x80, Tipp-Anzeigen 0x90
-    //    ausgenommen) UND eine Wiederholsperre greift.
-    if (decrypted[0] !== 0x01) return res.status(200).send('ok');
+    //    JEDEN Nicht-Text. Das erzeugte eine Endlosschleife — die Threema-App
+    //    quittiert JEDE zugestellte Nachricht mit einer Empfangsbestaetigung
+    //    (Typ 0x80), die hier wieder als "Nicht-Text" ankam: Hinweis -> Quittung
+    //    -> Hinweis -> ... 1773 Aufrufe in zwei Stunden.
+    //
+    //    Die Notbremse nannte zwei Bedingungen fuer eine Wiederaufnahme: sauber
+    //    nach Nachrichtentyp filtern UND eine Wiederholsperre. Beide sind jetzt
+    //    erfuellt — die Sperre steckt seit lib/sende-sperre.js in sendeE2E.
+    const typ = decrypted[0];
+
+    //    Steuernachrichten NIE beantworten. Threema legt sie ins obere Band:
+    //    0x80 Empfangsbestaetigung, 0x90 Tipp-Anzeige. Die Grenze bei 0x80 statt
+    //    zwei Einzelwerten ist Absicht — sie schliesst auch kuenftige
+    //    Steuertypen ein, und ein neuer Steuertyp waere genau der Weg zurueck in
+    //    die Schleife. Nutzinhalte liegen saemtlich unterhalb.
+    if (typ >= 0x80) return res.status(200).send('ok');
+
+    //    Nutzinhalt, den wir nicht lesen koennen — Sprachnachricht, Bild, Datei.
+    //    Der bisherige stille Wurf hiess: Marcus diktiert unterwegs eine Idee und
+    //    erfaehrt nie, dass sie nirgends ankam.
+    if (typ !== 0x01) {
+      const hinweis = await sendeE2E(from,
+        'Das kann ich noch nicht lesen — bitte als Text schicken. Das Diktat auf der Tastatur reicht.',
+        'hinweis-nicht-text');
+      if (!hinweis.ok && !hinweis.gesperrt) {
+        console.error('[beirat-callback] Hinweis Nicht-Text: ' + hinweis.fehler);
+      }
+      return res.status(200).send('ok');
+    }
 
     // Typ-Byte vorne, PKCS#7-artiges Padding hinten — beides weg, dann Klartext.
     // Diese zwei Zeilen fielen der Notbremse vom 27.07. versehentlich mit zum Opfer
@@ -146,6 +169,17 @@ export default async function handler(req, res) {
         body: JSON.stringify({ from, text, kanal: 'berentb', messageId }),
       });
       if (!r.ok) console.error(`[beirat-callback] n8n-Webhook (${kommando.name}) ` + r.status);
+    } else {
+      // Text, aber kein bekanntes Kommando. Antworten ist hier gefahrlos: die
+      // Quittung auf unsere Antwort ist Typ 0x80 und faellt oben in den stillen
+      // Zweig — die Schleife von damals kann so nicht entstehen.
+      const hinweis = await sendeE2E(from,
+        'Das habe ich nicht verstanden. Ich kenne zwei Kommandos: "idee …" für den '
+        + 'Ideenparkplatz und "/beirat …" für den Beirat. Stell eines davon voran.',
+        'hinweis-kein-kommando');
+      if (!hinweis.ok && !hinweis.gesperrt) {
+        console.error('[beirat-callback] Hinweis kein Kommando: ' + hinweis.fehler);
+      }
     }
   } catch (e) {
     console.error('[beirat-callback] Verarbeitung:', e.message);
