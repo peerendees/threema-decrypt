@@ -1,5 +1,6 @@
 import nacl from 'tweetnacl';
 import { sendeE2E } from '../lib/threema-e2e.js';
+import { darfSenden } from '../lib/sende-sperre.js';
 import crypto from 'node:crypto';
 
 // Erlaubte Origin für CORS. Für reine Server-zu-Server-Aufrufe (n8n) bleibt das leer,
@@ -73,6 +74,12 @@ async function handleSendSimple(req, res) {
   }
   if (!gatewayId || !gatewaySecret) {
     return res.status(500).json({ error: 'Gateway env not configured' });
+  }
+
+  // Schleifen-Notbremse, gleiche Begruendung wie beim E2E-Weg (siehe lib/sende-sperre.js).
+  const sperre = darfSenden(to, 'send_simple');
+  if (!sperre.erlaubt) {
+    return res.status(429).json({ error: 'Sendesperre aktiv', to });
   }
 
   try {
