@@ -112,7 +112,8 @@ export default async function handler(req, res) {
     );
     if (!decrypted) throw new Error('Entschluesselung fehlgeschlagen');
 
-    // 4) Nur Textnachrichten (Typ 0x01); alles andere STILL verwerfen.
+    // 4) Nur Textnachrichten (Typ 0x01); alles andere STILL verwerfen. Danach
+    //    Typ-Byte und Padding entfernen -> Klartext.
     //
     //    NOTBREMSE 27.07.2026: Hier stand kurzzeitig eine Hinweis-Antwort fuer
     //    Nicht-Text. Das erzeugte eine Endlosschleife — die Threema-App quittiert
@@ -122,6 +123,16 @@ export default async function handler(req, res) {
     //    Nachrichtentyp gefiltert wird (Quittungen 0x80, Tipp-Anzeigen 0x90
     //    ausgenommen) UND eine Wiederholsperre greift.
     if (decrypted[0] !== 0x01) return res.status(200).send('ok');
+
+    // Typ-Byte vorne, PKCS#7-artiges Padding hinten — beides weg, dann Klartext.
+    // Diese zwei Zeilen fielen der Notbremse vom 27.07. versehentlich mit zum Opfer
+    // (bf67218 entfernte den Block darueber und nahm sie mit). Folge: `text` war ab
+    // da nicht definiert, jede *BERENTB-Nachricht starb in Zeile 5) mit
+    // "text is not defined" — quittiert mit 200, also ohne Wiederholung und ohne Spur
+    // ausser einer Zeile im Vercel-Protokoll. Wer hier wieder aufraeumt: das Entpacken
+    // gehoert zur Zustellung, nicht zur Antwortlogik, und darf mit ihr nicht mitgehen.
+    const padLen = decrypted[decrypted.length - 1];
+    const text = Buffer.from(decrypted.slice(1, decrypted.length - padLen)).toString('utf8').trim();
 
     // 5) Bekanntes Kommando weiterreichen; alles andere stillschweigend ignorieren.
     const kommando = KOMMANDOS.find((k) => k.muster.test(text));
