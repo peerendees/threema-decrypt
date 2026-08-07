@@ -737,6 +737,23 @@ async function handleDeckblatt(body: Record<string, unknown>) {
   );
 
   // ---- Original-Belegseiten anhängen ----
+  await seitenAnhaengen(doc, PDFDocument, seiten);
+
+  const pdfBytes = await doc.save();
+  return jsonResponse({ success: true, pdfBase64: bytesToBase64(pdfBytes) });
+}
+
+/**
+ * Hängt die Original-Belegseiten an ein PDFDocument: PDF-Seiten werden kopiert,
+ * Bilder mittig auf eine A4-Seite eingebettet. Geteilt von Deckblatt (BER-99/107)
+ * und Original-Download (BER-131).
+ */
+async function seitenAnhaengen(
+  doc: import("npm:pdf-lib@1.17.1").PDFDocument,
+  PDFDocument: typeof import("npm:pdf-lib@1.17.1").PDFDocument,
+  seiten: Array<{ storage_path: string; mime_type?: string }>,
+) {
+  const A4: [number, number] = [595.28, 841.89];
   for (const s of seiten) {
     const bytes = await downloadFromStorage(s.storage_path);
     const mime = (s.mime_type || "").toLowerCase();
@@ -755,7 +772,27 @@ async function handleDeckblatt(body: Record<string, unknown>) {
       page.drawImage(img, { x: (A4[0] - w) / 2, y: (A4[1] - h) / 2, width: w, height: h });
     }
   }
+}
 
+/**
+ * BER-131: Original-Beleg als Gesamt-PDF (ohne Deckblatt). Bündelt alle
+ * Original-Belegseiten eines Belegs in ein einziges PDF zum Download aus dem
+ * Dashboard. Storage-Zugriff über den Service Key; Metadaten (RLS-geprüft)
+ * liefert die App. Nutzt denselben eng begrenzten DECKBLATT_TOKEN.
+ */
+async function handleBelegOriginal(body: Record<string, unknown>) {
+  const seiten = Array.isArray(body.seiten)
+    ? (body.seiten as Array<{ storage_path: string; mime_type?: string }>)
+    : [];
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return jsonResponse({ error: "Supabase service credentials not configured" }, 500);
+  }
+  if (seiten.length === 0) {
+    return jsonResponse({ error: "Keine Belegseiten übergeben" }, 400);
+  }
+  const { PDFDocument } = await import("npm:pdf-lib@1.17.1");
+  const doc = await PDFDocument.create();
+  await seitenAnhaengen(doc, PDFDocument, seiten);
   const pdfBytes = await doc.save();
   return jsonResponse({ success: true, pdfBase64: bytesToBase64(pdfBytes) });
 }
@@ -778,10 +815,12 @@ Deno.serve(async (req) => {
 
   const action = payload.action;
   const istDeckblatt = action === "bewirtung-deckblatt" || action === "termin-deckblatt";
-  // Deckblatt darf mit dem eng begrenzten DECKBLATT_TOKEN aufgerufen werden;
-  // alle übrigen Aktionen weiterhin nur mit dem vollen DECRYPT_API_TOKEN.
+  // Deckblatt UND Original-Download (BER-131) dürfen mit dem eng begrenzten
+  // DECKBLATT_TOKEN aufgerufen werden; alle übrigen Aktionen weiterhin nur mit
+  // dem vollen DECRYPT_API_TOKEN.
+  const mitDeckblattToken = istDeckblatt || action === "beleg-original";
   const authed = isAuthorized(req) ||
-    (istDeckblatt && !!DECKBLATT_TOKEN && isAuthorized(req, DECKBLATT_TOKEN));
+    (mitDeckblattToken && !!DECKBLATT_TOKEN && isAuthorized(req, DECKBLATT_TOKEN));
   if (!authed) {
     return jsonResponse({ error: "Unauthorized" }, 401);
   }
@@ -817,6 +856,9 @@ Deno.serve(async (req) => {
   }
   if (istDeckblatt) {
     return handleDeckblatt(payload);
+  }
+  if (action === "beleg-original") {
+    return handleBelegOriginal(payload);
   }
 
   return jsonResponse({ error: "Unknown action" }, 400);
